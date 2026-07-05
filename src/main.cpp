@@ -1,110 +1,214 @@
 #include <Arduino.h>
-#include <WiFi.h>
-#include <ESPAsyncWebServer.h>
-#include <ArduinoJson.h>
+#include <BLEDevice.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
 
-#define TRIG_PIN 5
-#define ECHO_PIN 18
+#define VIB_MOTOR_PIN 2
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
 
-const char* ssid     = "Hashir’s iphone";
-const char* password = "hashir1676";
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
 
-AsyncWebServer server(80);
+static BLEUUID serviceUUID("4fafc201-1fb5-459e-8fcc-c5c9c331914b");
+static BLEUUID charUUID("beb5483e-36e1-4688-b7f5-ea07361b26a8");
 
-int bottleCount = 5;
-String stockStatus = "FULL";
-String alertLevel = "OK";
-unsigned long lastCheck = 0;
+static boolean doConnect = false;
+static BLERemoteCharacteristic* pRemoteCharacteristic;
+static BLEAdvertisedDevice* myDevice;
 
-long getDistance() {
-  digitalWrite(TRIG_PIN, LOW);
-  delayMicroseconds(2);
-  digitalWrite(TRIG_PIN, HIGH);
-  delayMicroseconds(10);
-  digitalWrite(TRIG_PIN, LOW);
-  long duration = pulseIn(ECHO_PIN, HIGH, 30000);
-  return duration * 0.034 / 2;
+String currentState = "SAFE";
+unsigned long lastAnimFrame = 0;
+int animFrame = 0;
+
+void triggerVibration(int count, int durationOn, int durationOff) {
+ for (int i = 0; i < count; i++) {
+   digitalWrite(VIB_MOTOR_PIN, HIGH);
+   delay(durationOn);
+   digitalWrite(VIB_MOTOR_PIN, LOW);
+   delay(durationOff);
+ }
 }
 
-int distanceToCount(long dist) {
-  // +/- 1cm tolerance built in
-  if (dist <= 7)  return 5;   // 6cm = full
-  if (dist <= 9)  return 4;   // 8cm
-  if (dist <= 11) return 3;   // 10cm
-  if (dist <= 13) return 2;   // 12cm
-  if (dist <= 15) return 1;   // 14cm
-  return 0;                   // 16cm+ = empty
+// ── BATTERY ICON ──
+void drawBattery() {
+ display.drawRect(0, 0, 20, 9, SSD1306_WHITE);
+ display.fillRect(20, 2, 2, 5, SSD1306_WHITE);
+ display.fillRect(2, 2, 5, 5, SSD1306_WHITE);
+ display.fillRect(8, 2, 5, 5, SSD1306_WHITE);
+ display.fillRect(14, 2, 4, 5, SSD1306_WHITE);
 }
 
-void updateStatus(int count) {
-  if (count == 5) {
-    stockStatus = "FULL";
-    alertLevel  = "OK";
-  } else if (count >= 3) {
-    stockStatus = "NORMAL";
-    alertLevel  = "OK";
-  } else if (count >= 1) {
-    stockStatus = "LOW";
-    alertLevel  = "SUPPLY REQUEST";
-  } else {
-    stockStatus = "EMPTY";
-    alertLevel  = "EMERGENCY";
-  }
+// ── HEADER (shared across all screens) ──
+void drawHeader() {
+ drawBattery();
+ display.setTextSize(1);
+ display.setTextColor(SSD1306_WHITE);
+ display.setCursor(28, 1);
+ display.print("SafeNest Watch");
+ display.drawLine(0, 11, 128, 11, SSD1306_WHITE);
 }
+
+// ── HEART SHAPE ──
+void drawHeart(int x, int y) {
+ display.fillCircle(x + 4,  y + 4, 4, SSD1306_WHITE);
+ display.fillCircle(x + 10, y + 4, 4, SSD1306_WHITE);
+ display.fillTriangle(x, y + 6, x + 14, y + 6, x + 7, y + 14, SSD1306_WHITE);
+}
+
+// ── SAFE ANIMATION ──
+void showSafeAnimation() {
+ int offsets[] = {0, -2, -4, -2, 0, 2, 4, 2};
+ int yOff = offsets[animFrame % 8];
+
+ display.clearDisplay();
+ drawHeader();
+
+ drawHeart(57, 26 + yOff);
+
+ display.setTextSize(1);
+ display.setCursor(46, 48);
+ display.print("ALL SAFE");
+
+ for (int d = 0; d < (animFrame % 4); d++) {
+   display.fillCircle(50 + d * 10, 57, 2, SSD1306_WHITE);
+ }
+
+ display.display();
+}
+
+// ── CRYING ANIMATION ──
+void showCryingAnimation() {
+ display.clearDisplay();
+ drawHeader();
+
+ if (animFrame % 2 == 0) {
+   display.drawRect(1, 13, 126, 50, SSD1306_WHITE);
+   display.setTextSize(2);
+   display.setCursor(4, 18);
+   display.print("!");
+ }
+
+ display.setTextSize(1);
+ display.setCursor(20, 17);
+ display.print("ALERT DETECTED");
+
+ display.setTextSize(2);
+ display.setCursor(14, 32);
+ display.print("BABY CRY!");
+
+ // Sound wave arcs
+ int waveX = 108, waveY = 38;
+ if (animFrame % 3 >= 1) display.drawCircle(waveX, waveY, 5,  SSD1306_WHITE);
+ if (animFrame % 3 >= 2) display.drawCircle(waveX, waveY, 9,  SSD1306_WHITE);
+
+ display.display();
+}
+
+// ── ROLLED ANIMATION ──
+void showRolledAnimation() {
+ display.clearDisplay();
+ drawHeader();
+
+ if (animFrame % 2 == 0) {
+   display.drawRect(1, 13, 126, 50, SSD1306_WHITE);
+   display.setTextSize(2);
+   display.setCursor(4, 18);
+   display.print("!");
+ }
+
+ display.setTextSize(1);
+ display.setCursor(20, 17);
+ display.print("ALERT DETECTED");
+
+ display.setTextSize(2);
+ display.setCursor(8, 32);
+ display.print("ROLLED!");
+
+ // Rotating dot around circle
+ int cx = 108, cy = 38, r = 9;
+ display.drawCircle(cx, cy, r, SSD1306_WHITE);
+ float rad = ((animFrame % 4) * 90 * 3.14159) / 180.0;
+ int tipX = cx + r * cos(rad);
+ int tipY = cy + r * sin(rad);
+ display.fillCircle(tipX, tipY, 2, SSD1306_WHITE);
+
+ display.display();
+}
+
+// ── NOTIFY CALLBACK — DO NOT TOUCH ──
+static void notifyCallback(BLERemoteCharacteristic* pChar, uint8_t* pData, size_t len, bool isNotify) {
+ String msg = "";
+ for (int i = 0; i < len; i++) msg += (char)pData[i];
+
+ if (msg == "ALARM_MOVE") {
+   currentState = "ROLLED";
+   triggerVibration(10, 100, 100);
+ } else if (msg == "ALARM_SOUND") {
+   currentState = "CRYING";
+   triggerVibration(20, 200, 150);
+ } else if (msg == "SAFE") {
+   currentState = "SAFE";
+ }
+}
+
+class MyAdvertisedDeviceCallbacks : public BLEAdvertisedDeviceCallbacks {
+ void onResult(BLEAdvertisedDevice advertisedDevice) {
+   if (advertisedDevice.getName() == "CRIB_SENSOR") {
+     BLEDevice::getScan()->stop();
+     myDevice = new BLEAdvertisedDevice(advertisedDevice);
+     doConnect = true;
+   }
+ }
+};
 
 void setup() {
-  Serial.begin(115200);
-  pinMode(TRIG_PIN, OUTPUT);
-  pinMode(ECHO_PIN, INPUT);
+ Serial.begin(115200);
+ pinMode(VIB_MOTOR_PIN, OUTPUT);
 
-  WiFi.begin(ssid, password);
-  Serial.print("Connecting to WiFi");
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(500); Serial.print(".");
-  }
-  Serial.println();
-  Serial.print("IP Address: ");
-  Serial.println(WiFi.localIP());
+ if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+   Serial.println(F("SSD1306 allocation failed"));
+ }
 
-  DefaultHeaders::Instance().addHeader("Access-Control-Allow-Origin", "*");
-  DefaultHeaders::Instance().addHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
-  DefaultHeaders::Instance().addHeader("Access-Control-Allow-Headers", "*");
+ // Boot screen
+ display.clearDisplay();
+ drawHeader();
+ display.setTextSize(2);
+ display.setCursor(20, 28);
+ display.print("BOOTING..");
+ display.display();
 
-  server.on("/status", HTTP_OPTIONS, [](AsyncWebServerRequest *req){ req->send(200); });
+ BLEDevice::init("WATCH_UNIT");
+ BLEScan* pBLEScan = BLEDevice::getScan();
+ pBLEScan->setAdvertisedDeviceCallbacks(new MyAdvertisedDeviceCallbacks());
+ pBLEScan->setActiveScan(true);
+ pBLEScan->start(5, false);
 
-  server.on("/status", HTTP_GET, [](AsyncWebServerRequest *req) {
-    StaticJsonDocument<200> doc;
-    doc["medicine"]    = "Paracetamol";
-    doc["count"]       = bottleCount;
-    doc["total"]       = 5;
-    doc["stockStatus"] = stockStatus;
-    doc["alertLevel"]  = alertLevel;
-    doc["emergency"]   = (alertLevel == "EMERGENCY");
-    doc["supplyNeeded"]= (alertLevel == "SUPPLY REQUEST");
-    String out; serializeJson(doc, out);
-    req->send(200, "application/json", out);
-  });
-
-  server.begin();
-  Serial.println("Server started!");
+ Serial.println("Watch Unit Online - BLE & OLED");
 }
 
 void loop() {
-  if (millis() - lastCheck < 500) return;
-  lastCheck = millis();
+ // ── BLE CONNECT — DO NOT TOUCH ──
+ if (doConnect) {
+   BLEClient* pClient = BLEDevice::createClient();
+   if (pClient->connect(myDevice)) {
+     BLERemoteService* pSvc = pClient->getService(serviceUUID);
+     if (pSvc) {
+       pRemoteCharacteristic = pSvc->getCharacteristic(charUUID);
+       if (pRemoteCharacteristic && pRemoteCharacteristic->canNotify())
+         pRemoteCharacteristic->registerForNotify(notifyCallback);
+     }
+   }
+   doConnect = false;
+ }
 
-  long dist = getDistance();
-  if (dist == 0) return; // ignore bad readings
+ // ── ANIMATION TICK every 300ms ──
+ if (millis() - lastAnimFrame > 300) {
+   lastAnimFrame = millis();
+   animFrame++;
 
-  Serial.print("Distance: "); Serial.print(dist); Serial.println(" cm");
-
-  int newCount = distanceToCount(dist);
-
-  if (newCount != bottleCount) {
-    bottleCount = newCount;
-    updateStatus(bottleCount);
-    Serial.print(">> Count: "); Serial.print(bottleCount);
-    Serial.print(" | Status: "); Serial.print(stockStatus);
-    Serial.print(" | Alert: "); Serial.println(alertLevel);
-  }
+   if      (currentState == "SAFE")   showSafeAnimation();
+   else if (currentState == "CRYING") showCryingAnimation();
+   else if (currentState == "ROLLED") showRolledAnimation();
+ }
 }
